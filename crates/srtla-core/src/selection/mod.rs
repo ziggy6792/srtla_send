@@ -110,9 +110,7 @@ pub fn select_connection_idx(
 #[inline]
 fn apply_stall_gate(conns: &mut [SrtlaConnection], current_time_ms: u64, config: &ConfigSnapshot) {
     for c in conns.iter_mut() {
-        c.conn_timeout_ms = config.conn_timeout_ms;
-        c.reconnection.fast_retry_ms = config.reconnect_fast_retry_ms;
-        c.reconnection.fast_retry_attempts = config.reconnect_fast_retry_attempts;
+        c.apply_liveness_config(config);
         c.delay_budget_ms = config.negotiated_latency_ms;
     }
 

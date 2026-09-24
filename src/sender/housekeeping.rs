@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
+use srtla_core::config_snapshot::ConfigSnapshot;
 use srtla_core::connection::{STARTUP_GRACE_MS, SrtlaConnection};
 use srtla_core::registration::SrtlaRegistrationManager;
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,6 +15,10 @@ use super::uplink::{ConnIoMap, ConnectionId, ReaderHandle, UplinkPacket, restart
 pub const GLOBAL_TIMEOUT_MS: u64 = 10_000;
 
 /// Handle periodic housekeeping tasks.
+///
+/// `liveness` is the current config snapshot: its liveness settings are
+/// applied to every link before the timeout / reconnect checks, so a runtime
+/// change (control socket) reaches a link that carries no traffic.
 ///
 /// With the ring buffer sequence tracker, we no longer need periodic cleanup
 /// since old entries are naturally overwritten.
@@ -30,6 +35,7 @@ pub async fn handle_housekeeping(
     reader_handles: &mut HashMap<ConnectionId, ReaderHandle>,
     packet_tx: &UnboundedSender<UplinkPacket>,
     rehome: &mut RehomeGate,
+    liveness: &ConfigSnapshot,
 ) -> Result<()> {
     // If we're waiting on a REG2 response past the timeout, proactively retry REG1
     let current_ms = now_ms;
@@ -54,6 +60,7 @@ pub async fn handle_housekeeping(
 
     // housekeeping: drive registration, send keepalives
     for (i, conn) in connections.iter_mut().enumerate() {
+        conn.apply_liveness_config(liveness);
         // Simple reconnect-on-timeout, then allow reg driver to proceed
         if conn.is_timed_out(current_ms) {
             if conn.should_attempt_reconnect(current_ms) {
@@ -305,6 +312,7 @@ mod tests {
             &mut reader_handles,
             &packet_tx,
             &mut RehomeGate::new(false),
+            &ConfigSnapshot::default(),
         )
         .await
         .expect("housekeeping on an active connection must not fail");
@@ -314,6 +322,67 @@ mod tests {
         assert!(
             !reader_handles.get(&conn_id).unwrap().handle.is_finished(),
             "housekeeping must respawn the dead reader for the still-active connection"
+        );
+    }
+
+    /// A runtime change to the reconnect fast-retry window must reach a link
+    /// that is down and carries no traffic: housekeeping, not only the
+    /// per-packet selection pass, applies the current snapshot.
+    #[tokio::test]
+    async fn housekeeping_applies_runtime_retry_window_to_an_idle_link() {
+        let mut connections = vec![create_test_connection().await];
+        let mut conn_io = create_test_conn_io_map(&connections);
+        let mut reg = SrtlaRegistrationManager::new();
+        let mut all_failed_at: Option<u64> = None;
+        let mut seq_tracker = SequenceTracker::new();
+        let (packet_tx, _packet_rx) = create_uplink_channel();
+        let mut reader_handles: HashMap<ConnectionId, ReaderHandle> = HashMap::new();
+
+        // An established link that timed out and failed one reconnect at t0.
+        let t0 = now_ms();
+        connections[0].mark_for_recovery();
+        connections[0].reconnection.last_reconnect_attempt_ms = t0;
+        connections[0].reconnection.reconnect_failure_count = 1;
+
+        let slow = ConfigSnapshot {
+            reconnect_fast_retry_ms: 5_000,
+            ..ConfigSnapshot::default()
+        };
+        macro_rules! tick {
+            ($at:expr, $config:expr) => {{
+                let _ = handle_housekeeping(
+                    &mut connections,
+                    &mut conn_io,
+                    &mut reg,
+                    &mut seq_tracker,
+                    "127.0.0.1",
+                    false,
+                    $at,
+                    &mut all_failed_at,
+                    &mut reader_handles,
+                    &packet_tx,
+                    &mut RehomeGate::new(false),
+                    &$config,
+                )
+                .await;
+                connections[0].reconnection.clone()
+            }};
+        }
+
+        // Operator slowed the window to 5 s: 1.5 s after the last try is too soon.
+        let state = tick!(t0 + 1_500, slow);
+        assert_eq!(
+            state.fast_retry_ms, 5_000,
+            "snapshot must reach the idle link"
+        );
+        assert_eq!(state.last_reconnect_attempt_ms, t0, "no retry inside 5 s");
+
+        // Back to the 1 s default: the same instant is now due for a retry.
+        let state = tick!(t0 + 1_500, ConfigSnapshot::default());
+        assert_eq!(state.fast_retry_ms, 1_000);
+        assert_ne!(
+            state.last_reconnect_attempt_ms, t0,
+            "retry fires at 1 s cadence"
         );
     }
 
@@ -365,6 +434,7 @@ mod tests {
             &mut reader_handles,
             &packet_tx,
             &mut RehomeGate::new(false),
+            &ConfigSnapshot::default(),
         )
         .await;
         assert!(armed.is_ok(), "arming the all-failed timer must not error");
@@ -383,6 +453,7 @@ mod tests {
             &mut reader_handles,
             &packet_tx,
             &mut RehomeGate::new(false),
+            &ConfigSnapshot::default(),
         )
         .await;
         assert!(
@@ -403,6 +474,7 @@ mod tests {
             &mut reader_handles,
             &packet_tx,
             &mut RehomeGate::new(false),
+            &ConfigSnapshot::default(),
         )
         .await;
         assert!(
@@ -483,6 +555,7 @@ mod tests {
                 &mut self.reader_handles,
                 &packet_tx,
                 gate,
+                &ConfigSnapshot::default(),
             )
             .await
         }

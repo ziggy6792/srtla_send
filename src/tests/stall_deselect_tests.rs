@@ -1122,6 +1122,7 @@ mod tests {
         );
     }
 
+    /// The selection pass copies the fast-retry window onto each link.
     #[test]
     fn reconnect_fast_retry_reaches_the_link() {
         let rt = tokio::runtime::Runtime::new().unwrap();

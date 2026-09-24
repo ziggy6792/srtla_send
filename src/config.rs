@@ -199,10 +199,13 @@ impl DynamicConfig {
     }
 }
 
+/// Clamp a fast-retry cadence to
+/// [`RECONNECT_FAST_RETRY_MS_MIN`]..=[`RECONNECT_FAST_RETRY_MS_MAX`].
 fn clamp_fast_retry_ms(ms: u64) -> u64 {
     ms.clamp(RECONNECT_FAST_RETRY_MS_MIN, RECONNECT_FAST_RETRY_MS_MAX)
 }
 
+/// Cap a fast-retry attempt count at [`RECONNECT_FAST_RETRY_ATTEMPTS_MAX`].
 fn clamp_fast_retry_attempts(attempts: u32) -> u32 {
     attempts.min(RECONNECT_FAST_RETRY_ATTEMPTS_MAX)
 }

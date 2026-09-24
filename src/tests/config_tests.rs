@@ -57,6 +57,7 @@ mod tests {
         assert_eq!(config.snapshot().conn_timeout_ms, 9_000);
     }
 
+    /// Defaults are 1000 ms × 4; setter and CLI values are clamped.
     #[test]
     fn test_reconnect_fast_retry_defaults_and_clamps() {
         let config = DynamicConfig::new();
@@ -110,6 +111,7 @@ mod tests {
         );
     }
 
+    /// `set_reconnect_fast_retry` applies and echoes values; empty params error.
     #[test]
     fn test_set_reconnect_fast_retry_over_control() {
         let config = DynamicConfig::new();

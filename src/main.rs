@@ -5,8 +5,9 @@
 // two, and keeps the library's embedder-facing surface (the Android and Apple
 // binders no CLI ever constructs) from reading as dead code here.
 use anyhow::{Context, Result};
-use clap::Parser;
 use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use srtla_core::mode::SchedulingMode;
 use srtla_send::{
     config, control_socket, metrics, net, priority_listener, sender, stats, subscriptions,
@@ -53,7 +54,10 @@ struct Cli {
     #[arg(long = "control-socket")]
     control_socket: Option<String>,
 
-    /// Path to TOML config file (reloaded on SIGHUP)
+    /// Path to a TOML config file, read once at startup. Its values override
+    /// the built-in defaults; flags given on the command line override it.
+    /// (SIGHUP reloads the IP list only; use the control socket to change
+    /// settings at runtime.)
     #[arg(long = "config")]
     config_file: Option<String>,
 
@@ -160,6 +164,66 @@ fn warn_if_not_loopback(what: &str, addr: std::net::SocketAddr) {
     }
 }
 
+impl Cli {
+    /// Merge a TOML config into the parsed arguments. Precedence is
+    /// command-line flag > TOML > built-in default: a key is taken from the
+    /// TOML unless its flag was given explicitly on the command line
+    /// (`ArgMatches::value_source`). `TomlConfig` fills absent keys with the
+    /// same defaults as the flags, so a partial file changes only what it sets.
+    fn apply_toml(&mut self, toml: &toml_config::TomlConfig, matches: &ArgMatches) {
+        let from_toml = |id: &str| matches.value_source(id) != Some(ValueSource::CommandLine);
+        if from_toml("mode") {
+            match toml.mode.parse::<SchedulingMode>() {
+                Ok(mode) => self.mode = mode,
+                Err(_) => tracing::warn!("config: ignoring unknown mode {:?}", toml.mode),
+            }
+        }
+        if from_toml("no_quality") {
+            self.no_quality = toml.no_quality;
+        }
+        if from_toml("no_stall_deselect") {
+            self.no_stall_deselect = toml.no_stall_deselect;
+        }
+        if from_toml("stall_min_in_flight") {
+            self.stall_min_in_flight = toml.stall_min_in_flight;
+        }
+        if from_toml("stall_ack_stale_ms") {
+            self.stall_ack_stale_ms = toml.stall_ack_stale_ms;
+        }
+        if from_toml("conn_timeout_ms") {
+            self.conn_timeout_ms = toml.conn_timeout_ms;
+        }
+        if from_toml("reconnect_fast_retry_ms") {
+            self.reconnect_fast_retry_ms = toml.reconnect_fast_retry_ms;
+        }
+        if from_toml("reconnect_fast_retry_attempts") {
+            self.reconnect_fast_retry_attempts = toml.reconnect_fast_retry_attempts;
+        }
+        let unused = toml.unwired_keys_set();
+        if !unused.is_empty() {
+            tracing::warn!(
+                "config: these keys are parsed but not used by this build: {}",
+                unused.join(", ")
+            );
+        }
+    }
+
+    /// Build the runtime configuration from the (merged) arguments.
+    fn dynamic_config(&self) -> config::DynamicConfig {
+        config::DynamicConfig::from_cli(
+            self.mode,
+            self.no_quality,
+            self.no_stall_deselect,
+            self.stall_min_in_flight,
+            self.stall_ack_stale_ms,
+            self.conn_timeout_ms,
+            self.reconnect_fast_retry_ms,
+            self.reconnect_fast_retry_attempts,
+            self.no_rehome,
+        )
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -167,10 +231,18 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let args = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut args = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if args.print_version {
         println!("{}", version::version_line());
         return Ok(());
+    }
+
+    // Load TOML config (if specified); explicit CLI flags override it.
+    if let Some(path) = args.config_file.clone() {
+        let toml_cfg = toml_config::TomlConfig::load_or_default(std::path::Path::new(&path));
+        tracing::debug!("TOML config loaded: {:?}", toml_cfg);
+        args.apply_toml(&toml_cfg, &matches);
     }
 
     let local_srt_port = args.local_srt_port.expect("required");
@@ -178,23 +250,7 @@ async fn main() -> Result<()> {
     let receiver_port = args.receiver_port.expect("required");
     let ips_file = args.ips_file.as_deref().expect("required");
 
-    // Load TOML config (if specified), then apply CLI overrides
-    if let Some(ref path) = args.config_file {
-        let toml_cfg = toml_config::TomlConfig::load_or_default(std::path::Path::new(path));
-        tracing::debug!("TOML config loaded: {:?}", toml_cfg);
-    }
-
-    let config = config::DynamicConfig::from_cli(
-        args.mode,
-        args.no_quality,
-        args.no_stall_deselect,
-        args.stall_min_in_flight,
-        args.stall_ack_stale_ms,
-        args.conn_timeout_ms,
-        args.reconnect_fast_retry_ms,
-        args.reconnect_fast_retry_attempts,
-        args.no_rehome,
-    );
+    let config = args.dynamic_config();
     {
         let snap = config.snapshot();
         tracing::info!(
@@ -272,4 +328,68 @@ async fn main() -> Result<()> {
     )
     .await
     .context("srtla_send failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const POSITIONAL: [&str; 4] = ["6000", "127.0.0.1", "5000", "/tmp/ips"];
+
+    /// Parse `flags` like the binary does, merge `toml`, return the snapshot.
+    fn effective(flags: &[&str], toml: &str) -> config::ConfigSnapshot {
+        let argv = std::iter::once("srtla_send")
+            .chain(flags.iter().copied())
+            .chain(POSITIONAL);
+        let matches = Cli::command().try_get_matches_from(argv).unwrap();
+        let mut args = Cli::from_arg_matches(&matches).unwrap();
+        args.apply_toml(&toml::from_str(toml).unwrap(), &matches);
+        args.dynamic_config().snapshot()
+    }
+
+    #[test]
+    fn toml_values_apply_when_no_flag_is_given() {
+        let snap = effective(
+            &[],
+            "reconnect_fast_retry_attempts = 0\nconn_timeout_ms = 2000\nmode = \"classic\"\n",
+        );
+        assert_eq!(snap.reconnect_fast_retry_attempts, 0);
+        assert_eq!(snap.conn_timeout_ms, 2000);
+        assert_eq!(snap.mode, SchedulingMode::Classic);
+        // Keys the file does not set keep their defaults.
+        assert_eq!(
+            snap.reconnect_fast_retry_ms,
+            config::RECONNECT_FAST_RETRY_MS
+        );
+    }
+
+    #[test]
+    fn explicit_flags_override_toml() {
+        let snap = effective(
+            &[
+                "--conn-timeout-ms",
+                "3000",
+                "--reconnect-fast-retry-attempts",
+                "2",
+            ],
+            "reconnect_fast_retry_attempts = 0\nconn_timeout_ms = 2000\n",
+        );
+        assert_eq!(snap.conn_timeout_ms, 3000);
+        assert_eq!(snap.reconnect_fast_retry_attempts, 2);
+    }
+
+    #[test]
+    fn a_flag_equal_to_the_default_still_overrides_toml() {
+        // Precedence is by source, not by value: `--conn-timeout-ms 5000`
+        // (the default) must win over a TOML value.
+        let snap = effective(&["--conn-timeout-ms", "5000"], "conn_timeout_ms = 2000\n");
+        assert_eq!(snap.conn_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn toml_bool_flags_apply() {
+        let snap = effective(&[], "no_quality = true\nno_stall_deselect = true\n");
+        assert!(!snap.quality_enabled);
+        assert!(!snap.stall_deselect);
+    }
 }

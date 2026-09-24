@@ -21,6 +21,7 @@ pub struct ReconnectionState {
 }
 
 impl Default for ReconnectionState {
+    /// A fresh link: no attempts yet, fast-retry window at the built-in defaults.
     fn default() -> Self {
         Self {
             last_reconnect_attempt_ms: 0,
@@ -49,6 +50,9 @@ impl ReconnectionState {
         delay.min(MAX_BACKOFF_DELAY_MS)
     }
 
+    /// Whether a timed-out link may try to reconnect at `now`: ~1 s cadence
+    /// during initial registration (after the startup grace), otherwise once
+    /// [`Self::backoff_delay`] has passed since the last attempt.
     pub fn should_attempt_reconnect(&self, now: u64) -> bool {
         if self.connection_established_ms == 0 {
             if now <= self.startup_grace_deadline_ms {
@@ -70,6 +74,9 @@ impl ReconnectionState {
         time_since_last_attempt >= self.backoff_delay()
     }
 
+    /// Record a reconnect attempt at `now`. For a link that was established
+    /// this counts a failure (advancing the fast-retry window / backoff ladder)
+    /// and logs when the next attempt is due.
     pub fn record_attempt(&mut self, label: &str, now: u64) {
         self.last_reconnect_attempt_ms = now;
 
@@ -92,6 +99,8 @@ impl ReconnectionState {
         );
     }
 
+    /// The link re-registered: reset the failure count, so the next outage
+    /// starts again at the fast-retry cadence.
     pub fn mark_success(&mut self, label: &str) {
         if self.reconnect_failure_count > 0 {
             info!("{}: Reconnection successful, resetting backoff", label);
@@ -99,6 +108,8 @@ impl ReconnectionState {
         }
     }
 
+    /// Restart the startup grace period that delays a fresh link's first
+    /// registration retry.
     pub fn reset_startup_grace(&mut self, now: u64) {
         self.startup_grace_deadline_ms = now + STARTUP_GRACE_MS;
     }
@@ -116,6 +127,7 @@ mod tests {
         }
     }
 
+    /// An established link with a custom fast-retry window.
     fn established_with(fast_retry_ms: u64, fast_retry_attempts: u32) -> ReconnectionState {
         ReconnectionState {
             fast_retry_ms,
@@ -154,6 +166,7 @@ mod tests {
         10_000, 20_000, 40_000, 80_000, 120_000, 120_000, 120_000, 120_000,
     ];
 
+    /// The built-in window is 1000 ms × 4.
     #[test]
     fn defaults_are_one_second_for_four_attempts() {
         let state = ReconnectionState::default();
@@ -161,6 +174,7 @@ mod tests {
         assert_eq!(state.fast_retry_attempts, 4);
     }
 
+    /// An established link may retry exactly 1000 ms after its last attempt.
     #[test]
     fn established_link_retries_after_one_second() {
         let mut state = established();
@@ -171,6 +185,7 @@ mod tests {
         assert!(state.should_attempt_reconnect(t + 1000));
     }
 
+    /// Default schedule: three 1 s waits, then 5 s doubling to the 120 s cap.
     #[test]
     fn fast_window_then_exponential_ladder() {
         // Attempts 1-3 wait 1 s; the 4th recorded failure starts the ladder, so
@@ -183,6 +198,7 @@ mod tests {
         );
     }
 
+    /// After four recorded failures the next wait is exactly 5000 ms.
     #[test]
     fn fifth_attempt_waits_five_seconds() {
         let mut state = established();
@@ -198,6 +214,7 @@ mod tests {
         assert!(state.should_attempt_reconnect(t + 5000));
     }
 
+    /// `attempts = 0` reproduces the pre-window ladder exactly.
     #[test]
     fn zero_attempts_is_the_plain_ladder() {
         // Opt-out: with no fast-retry window the schedule is exactly the
@@ -210,6 +227,7 @@ mod tests {
         );
     }
 
+    /// A custom window (2000 ms × 2) is honoured.
     #[test]
     fn window_is_configurable() {
         assert_eq!(
@@ -218,6 +236,7 @@ mod tests {
         );
     }
 
+    /// A successful re-registration returns the link to the fast window.
     #[test]
     fn success_resets_to_fast_retry() {
         let mut state = established();
@@ -228,6 +247,7 @@ mod tests {
         assert_eq!(wait_after_attempt(&mut state, 200_000), 1000);
     }
 
+    /// Initial registration keeps its ~1 s cadence regardless of the window.
     #[test]
     fn initial_registration_cadence_unchanged() {
         let mut state = ReconnectionState {

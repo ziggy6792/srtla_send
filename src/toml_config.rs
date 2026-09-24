@@ -1,7 +1,12 @@
 //! Optional TOML file configuration for srtla_send.
 //!
-//! Loaded at startup via `--config <path>` and reloaded on SIGHUP.
+//! Read once at startup via `--config <path>` and merged under the command
+//! line: an explicitly given flag wins over the file, the file wins over the
+//! built-in default. SIGHUP reloads the IP list only, not this file.
 //! All fields use `#[serde(default)]` so a partial config file is valid.
+//!
+//! The congestion/lifecycle/selection tuning keys below are parsed but not yet
+//! wired to the sender; setting one logs a startup warning.
 
 use std::path::Path;
 
@@ -85,6 +90,39 @@ impl TomlConfig {
         toml::from_str(&content).map_err(|e| format!("failed to parse {path:?}: {e}"))
     }
 
+    /// Names of the keys set to a non-default value that this build parses but
+    /// does not apply (the congestion / lifecycle / selection tuning section),
+    /// so the operator is told instead of silently ignored.
+    pub fn unwired_keys_set(&self) -> Vec<&'static str> {
+        let d = Self::default();
+        let mut keys = Vec::new();
+        if self.rtt_velocity_gate != d.rtt_velocity_gate {
+            keys.push("rtt_velocity_gate");
+        }
+        if self.warming_rtt_probes != d.warming_rtt_probes {
+            keys.push("warming_rtt_probes");
+        }
+        if self.warming_timeout_ms != d.warming_timeout_ms {
+            keys.push("warming_timeout_ms");
+        }
+        if self.degraded_quality_threshold != d.degraded_quality_threshold {
+            keys.push("degraded_quality_threshold");
+        }
+        if self.degraded_nak_burst_threshold != d.degraded_nak_burst_threshold {
+            keys.push("degraded_nak_burst_threshold");
+        }
+        if self.cooldown_duration_ms != d.cooldown_duration_ms {
+            keys.push("cooldown_duration_ms");
+        }
+        if self.min_switch_interval_ms != d.min_switch_interval_ms {
+            keys.push("min_switch_interval_ms");
+        }
+        if self.switch_hysteresis != d.switch_hysteresis {
+            keys.push("switch_hysteresis");
+        }
+        keys
+    }
+
     /// Load config, logging errors and falling back to defaults.
     pub fn load_or_default(path: &Path) -> Self {
         match Self::load(path) {
@@ -110,6 +148,14 @@ mod tests {
         assert_eq!(cfg.mode, "enhanced");
         assert!(!cfg.no_quality);
         assert!((cfg.rtt_velocity_gate - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_unwired_keys_reported() {
+        assert!(TomlConfig::default().unwired_keys_set().is_empty());
+        let cfg: TomlConfig =
+            toml::from_str("switch_hysteresis = 1.5\nconn_timeout_ms = 2000").unwrap();
+        assert_eq!(cfg.unwired_keys_set(), vec!["switch_hysteresis"]);
     }
 
     #[test]

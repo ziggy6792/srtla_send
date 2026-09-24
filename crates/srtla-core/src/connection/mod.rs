@@ -1335,14 +1335,29 @@ impl SrtlaConnection {
         self.quality_cache.multiplier
     }
 
+    /// Copy the runtime-tunable liveness settings (`conn_timeout_ms` and the
+    /// reconnect fast-retry window) from `config` onto this link. Called from
+    /// both the selection pass and housekeeping, so a change made over the
+    /// control socket reaches a link even while no packets flow through it.
+    pub fn apply_liveness_config(&mut self, config: &crate::config_snapshot::ConfigSnapshot) {
+        self.conn_timeout_ms = config.conn_timeout_ms;
+        self.reconnection.fast_retry_ms = config.reconnect_fast_retry_ms;
+        self.reconnection.fast_retry_attempts = config.reconnect_fast_retry_attempts;
+    }
+
+    /// Whether this timed-out link may try to reconnect at `now_ms`
+    /// (see [`ReconnectionState::should_attempt_reconnect`]).
     pub fn should_attempt_reconnect(&self, now_ms: u64) -> bool {
         self.reconnection.should_attempt_reconnect(now_ms)
     }
 
+    /// Record a reconnect attempt at `now_ms` (see
+    /// [`ReconnectionState::record_attempt`]).
     pub fn record_reconnect_attempt(&mut self, now_ms: u64) {
         self.reconnection.record_attempt(&self.label, now_ms);
     }
 
+    /// Reset the reconnect backoff after the link re-registered.
     pub fn mark_reconnect_success(&mut self) {
         self.reconnection.mark_success(&self.label);
     }

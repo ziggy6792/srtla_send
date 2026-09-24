@@ -287,6 +287,8 @@ fn dispatch_inner(
     })
 }
 
+/// Execute one control-protocol method (everything except the subscription
+/// methods) against `config` and return its JSON result or a JSON-RPC error.
 fn handle_method(
     config: &DynamicConfig,
     stats: Option<&SharedStats>,

@@ -209,6 +209,7 @@ pub async fn run_sender_with_config(
             &mut reader_handles,
             &packet_tx,
             &mut rehome,
+            &config.snapshot(),
         )
         .await
         {
@@ -296,6 +297,7 @@ pub async fn run_sender_with_config(
                             &mut reader_handles,
                             &packet_tx,
                             &mut rehome,
+                            &config.snapshot(),
                         ).await {
                             warn!("housekeeping failed: {err}");
                         }
